@@ -1,6 +1,6 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
-const genAI = new GoogleGenerativeAI("AIzaSyCxQ_okmKpBt_8ljSwWXLKrAxtr-3cSApA");
+export const genAI = new GoogleGenerativeAI("AIzaSyCxQ_okmKpBt_8ljSwWXLKrAxtr-3cSApA");
 
 // This converts the local file object into Base64 so the Cloud API can "see" it
 const fileToDataPart = async (file) => {

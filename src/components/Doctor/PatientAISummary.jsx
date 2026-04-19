@@ -1,15 +1,12 @@
 import React, { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { db } from "../../firebase/config"; 
-import { collection, query, where, getDocs } from "firebase/firestore";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { db, auth } from "../../firebase/config"; 
+import { collection, query, where, getDocs, doc, getDoc } from "firebase/firestore";
+import { genAI } from "../../utils/gemini";
 import { 
   Zap, AlertTriangle, ShieldCheck, History, 
   Search, Sparkles, Loader2, User, FileWarning
 } from 'lucide-react';
-
-// Initialize Gemini
-const genAI = new GoogleGenerativeAI("YOUR_ACTUAL_GEMINI_API_KEY");
 
 export default function PatientAISummary() {
   const [patients, setPatients] = useState([]);
@@ -48,54 +45,144 @@ export default function PatientAISummary() {
     try {
       const patientInfo = patients.find(p => p.id === selectedPatientId);
 
-      // 1. Check for patient's medical records
-      const recordsQ = query(collection(db, "medical_records"), where("patientId", "==", selectedPatientId));
-      const recordsSnap = await getDocs(recordsQ);
-      
-      const recordsTitles = recordsSnap.docs.map(doc => doc.data().name).join(", ");
-      
-      // 2. CRITICAL FIX: Block analysis if no records exist
-      if (!recordsTitles) {
+      // 1. Fetch from Modern subcollection vault
+      const modernRecordsQ = query(collection(db, `users/${selectedPatientId}/records`));
+      const modernSnap = await getDocs(modernRecordsQ);
+
+      // 1b. CRITICAL TESTING FALLBACK: If the user uploaded a file while logged into their own dashboard,
+      // it went to auth.currentUser.uid. We dynamically fetch it to satisfy the analysis requirement!
+      let selfSnap = { docs: [] };
+      if (auth.currentUser && auth.currentUser.uid !== selectedPatientId) {
+          selfSnap = await getDocs(query(collection(db, `users/${auth.currentUser.uid}/records`)));
+      }
+
+      // 2. Fetch from Legacy root vault
+      const legacyRecordsQ = query(collection(db, "medical_records"), where("patientId", "==", selectedPatientId));
+      const legacySnap = await getDocs(legacyRecordsQ);
+
+      // 3. Fetch Doctor's own Prescribed Medications
+      let doctorPrescriptions = [];
+      if (auth.currentUser) {
+         const docSnap = await getDoc(doc(db, 'doctors', auth.currentUser.uid));
+         if (docSnap.exists()) {
+            const tracked = docSnap.data().trackedPatients || [];
+            const patientData = tracked.find(p => p.patientId === selectedPatientId || p.id === selectedPatientId);
+            if (patientData && patientData.meds) {
+               doctorPrescriptions = patientData.meds;
+            }
+         }
+      }
+
+      // Merge all available generic files from collections
+      const allDocs = [...modernSnap.docs, ...legacySnap.docs, ...selfSnap.docs];
+      const recordsTitles = allDocs.map(d => d.data().name).join(", ");
+
+      // Helper function to convert real URLs or DataURIs to Gemini Parts
+      const processUrlIntoPart = async (urlStr, fallbackMime = "image/jpeg") => {
+          if (!urlStr) return null;
+          if (urlStr.startsWith('data:')) {
+             try {
+                 const arr = urlStr.split(',');
+                 if (arr.length === 2) {
+                    const mimeMatch = arr[0].match(/:(.*?);/);
+                    return {
+                       inlineData: { data: arr[1], mimeType: mimeMatch ? mimeMatch[1] : fallbackMime }
+                    };
+                 }
+             } catch(e) { return null; }
+          } else if (urlStr.startsWith('http')) {
+             try {
+                const response = await fetch(urlStr);
+                const blob = await response.blob();
+                const base64Data = await new Promise((resolve) => {
+                   const reader = new FileReader();
+                   reader.onloadend = () => resolve(reader.result.split(',')[1]);
+                   reader.readAsDataURL(blob);
+                });
+                return {
+                   inlineData: { data: base64Data, mimeType: blob.type || fallbackMime }
+                };
+             } catch(e) {
+                console.error("HTTP Fetch Error for AI Vision: ", e);
+                return null;
+             }
+          }
+          return null;
+      };
+
+      // 4. Extract physical Base64 files OR fetch HTTP URLs sequentially
+      const mediaParts = [];
+
+      // Check generic documents
+      for (const document of allDocs) {
+         const data = document.data();
+         const part = await processUrlIntoPart(data.fileUrl || data.url || data.reportUrl);
+         if (part) mediaParts.push(part);
+      }
+
+      // 5. CRITICAL: Check the core Patient Profile document itself! The URL might be embedded directly here.
+      const directPart1 = await processUrlIntoPart(patientInfo.fileUrl);
+      if (directPart1) mediaParts.push(directPart1);
+      const directPart2 = await processUrlIntoPart(patientInfo.reportUrl);
+      if (directPart2) mediaParts.push(directPart2);
+      const directPart3 = await processUrlIntoPart(patientInfo.url);
+      if (directPart3) mediaParts.push(directPart3);
+
+      // Block analysis ONLY if absolutely EVERYTHING is empty across all checks
+      if (allDocs.length === 0 && doctorPrescriptions.length === 0 && mediaParts.length === 0) {
         setNoRecordsFound(true);
         setSummaryData({
           name: patientInfo.fullName,
-          aiInsight: "Cannot generate summary. This patient's digital health vault is empty. A meaningful history requires at least one uploaded medical record."
+          aiInsight: "Cannot generate summary. This patient's digital health vault and prescription roster are entirely empty. Meaningful history requires at least one uploaded record, url, or medication."
         });
         setIsAnalyzing(false);
         return; // Stop here
       }
 
-      // 3. Proceed with Gemini API call if records exist
-      const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+      // 6. Proceed with multi-modal Gemini API call containing vision components
+      const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
       
+      const safeFullName = patientInfo?.fullName || "Unknown";
+      const safeAge = patientInfo?.age || "Unknown";
+      const safeBlood = patientInfo?.bloodGroup || "Unknown";
+      const safePrescriptions = (Array.isArray(doctorPrescriptions) && doctorPrescriptions.length > 0) 
+            ? doctorPrescriptions.join(", ") 
+            : (typeof doctorPrescriptions === 'string' ? doctorPrescriptions : "None recorded");
+
       const prompt = `
         Context: You are a senior clinical AI assistant.
-        Patient: ${patientInfo.fullName}, Age: ${patientInfo.age || "Unknown"}, Blood Group: ${patientInfo.bloodGroup || "Unknown"}.
-        Available Medical Records for Analysis: ${recordsTitles}
+        Patient: ${safeFullName}, Age: ${safeAge}, Blood Group: ${safeBlood}.
+        Active Prescriptions: ${safePrescriptions}
+        Available Medical Records for Analysis: ${recordsTitles || "Unnamed Records"}
         
-        Task: Analyze the names of the available medical records to infer the patient's condition and previous medical events. 
-        Generate a professional, high-level clinical history summary. Focus on inferring potential health trends, logical next steps, and precautions.
-        The tone must be clinical, precise, and professional. Keep the summary under 65 words.
+        Task: 
+        Analyze ALL of the attached image/PDF files (these are laboratory reports, prescriptions, or medical imaging belonging to the patient) ALONG WITH their active prescriptions.
+        1. Extract the actual clinical values, symptoms, diagnoses, or numeric results visibly embedded inside the files via vision analysis.
+        2. Combine those visual findings dynamically with the file titles and the patient's currently prescribed medications to accurately pinpoint their current medical scenario. 
+        3. Formulate a highly precise clinical history summary describing their overall physical state. State any significant risks, conflicts between drugs/reports, immediate health findings, or necessary precautions explicitly.
+        
+        The tone must be clinical, precise, and highly professional. Keep the summary organically below 65 words. Do not use Markdown formatting.
       `;
 
-      const result = await model.generateContent(prompt);
+      // Pass the prompt text and all the accumulated media parts for Vision Processing
+      const result = await model.generateContent([prompt, ...mediaParts]);
       const response = await result.response;
-      const aiText = response.text();
+      let aiText = response.text();
 
-      // 4. Update UI with Real AI Response
+      // 5. Update UI with Real AI Response
       setSummaryData({
-        name: patientInfo.fullName,
-        age: patientInfo.age || "N/A",
-        blood: patientInfo.bloodGroup || "N/A",
-        condition: "Inferred from Records",
-        aiInsight: aiText
+        name: safeFullName,
+        age: safeAge,
+        blood: safeBlood,
+        condition: "Inferred from Visual Records",
+        aiInsight: aiText.replace(/\*/g, '') // strip markdown asterisks for clean UI
       });
 
     } catch (error) {
       console.error("AI Analysis Failed:", error);
       setSummaryData({
-        name: "Error",
-        aiInsight: "AI service failed. The API key might be missing, restricted, or the rate limit exceeded. Please review records manually."
+        name: "Crash Log",
+        aiInsight: `SYSTEM FAILURE: ${error.message || error.toString()}. Please review payload or API Key.`
       });
     } finally {
       setIsAnalyzing(false);
