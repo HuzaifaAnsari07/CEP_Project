@@ -8,7 +8,7 @@ import {
 import { auth } from "../firebase/config";
 
 // Component Imports
-import DoctorSidebar from '../components/Doctor/DoctorSIdebar';
+import DoctorSidebar from '../components/Doctor/DoctorSidebar';
 import AppointmentSection from '../components/Doctor/AppointmentSection';
 import PatientManager from '../components/Doctor/PatientManager';
 import PatientAISummary from '../components/Doctor/PatientAISummary';
